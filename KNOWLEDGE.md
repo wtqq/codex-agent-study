@@ -323,6 +323,100 @@ turn/start
 
 > 上方的总体架构图是 **逻辑架构**（分层视图），本节是 **技术架构**（语言 / 进程 / crate / 数据流）。两张图互补：逻辑架构讲 design philosophy，技术架构讲 how it actually works。
 
+## 数据架构
+
+Codex 的持久化采用 **JSONL（canonical）+ SQLite（index/projection）+ session_index（name lookup）+ ThreadStore trait（abstraction）** 四层模型。
+
+### 存储全景
+
+```
+$CODEX_HOME/
++-- sessions/
+|   +-- rollout-2025-05-07T17-24-21-<uuid>.jsonl    ← 会话回放数据
+|   +-- rollout-2025-05-07T17-24-21-<uuid>.jsonl.zst ← 冷压缩
++-- archived_sessions/
+|   +-- <same structure>                              ← 归档会话
++-- session_index.jsonl                               ← 名称 → ID 映射
++-- state_5.sqlite                                    ← 线程元数据/配置/goals
++-- logs_2.sqlite                                     ← 事件日志
++-- goals_1.sqlite                                    ← goal 状态
++-- memories_1.sqlite                                 ← 记忆产物
++-- thread_history_1.sqlite                           ← JSONL 字节偏移投影
+```
+
+### 第 1 层：JSONL Rollout（canonical source of truth）
+
+- 路径：`sessions/rollout-<ISO8601>-<uuid>.jsonl`，归档移入 `archived_sessions/`
+- 格式：每行一条 `RolloutItem` JSON（`codex-rs/rollout/src/recorder.rs`），可用 `jq` / `fx` 直接查看
+- 写入：`RolloutRecorder` 后台 writer task（mpsc channel），`Create` 模式建新文件、`Resume` 模式追加已有文件
+- 过滤策略（`policy.rs`）：并非所有 item 都落盘，筛选 `ResponseItem`、`InterAgentCommunication`、`EventMsg`、`Compacted`、`TurnContext`、`WorldState`、`SessionMeta` 等
+- 压缩：后台 worker（`compression.rs`）将冷文件压缩为 `.jsonl.zst`（Zstandard）；读取时透明解压（`RolloutLineReader` 自动处理 `.jsonl` 和 `.jsonl.zst` 两种格式）
+
+### 第 2 层：SQLite 索引（结构化查询）
+
+- `state_5.sqlite`：线程元数据（title、cwd、source、model、创建/更新时间）、config、external agent imports、goals
+- `logs_2.sqlite`：运行事件日志
+- `goals_1.sqlite`：goal 状态持久化
+- `memories_1.sqlite`：记忆产物（两阶段管线产出）
+- `thread_history_1.sqlite`：**JSONL 字节偏移投影**（`projection_state`）——记录 `thread_id → next_rollout_byte_offset + next_rollout_ordinal`，将 JSONL 的 ordinal 映射为文件字节偏移，支持 O(1) 按 turn/item 跳转
+- 连接参数：WAL journal mode、auto-vacuum、synchronous=NORMAL、sqlx pool
+- 启动时 `state_db::init()` 打开/创建各 DB，执行 migrations，然后 backfill（扫描 JSONL 补全 SQLite 元数据）
+
+### 第 3 层：Session Index（名称快速映射）
+
+- 文件：`session_index.jsonl`（`rollout/src/session_index.rs`）
+- 格式：`SessionIndexEntry { id: ThreadId, thread_name, updated_at }`
+- 写入：append-only，最后写入覆盖同名 entry；随线程重命名/删除时更新
+- 读取：`find_thread_name_by_id` 从文件末尾反向扫描，取最新匹配
+
+### 第 4 层：ThreadStore Trait（统一抽象）
+
+- `ThreadStore` trait（`thread-store/src/store.rs`）定义所有持久化操作的 trait 接口：
+  - 写入：`create_thread` / `resume_thread` / `append_items` / `persist_thread` / `flush_thread` / `shutdown_thread` / `discard_thread`
+  - 读取：`load_history` / `load_latest_model_context` / `list_items` / `list_turns` / `search_threads` / `search_thread_occurrences`
+  - 管理：`archive_thread` / `delete_thread` / `move_thread_to_section` / `update_thread_metadata` / `prepare_fork` / `create_fork`
+- `LocalThreadStore` 实现：内存中维护 `LiveThread`（active writer handle + locks），底层对接 JSONL + SQLite
+- `InMemoryThreadStore`：测试用无持久化实现
+
+### Agent Graph Store（多 agent 拓扑）
+
+- `agent-graph-store/`：独立存储线程的 parent/child 关系（哪个线程 spawn 了哪个子代理）
+- `ThreadSpawnEdgeStatus`：跟踪 spawn 状态（in_progress / completed / failed）
+
+### Model Context 重建
+
+- `load_latest_model_context`：从 `thread_history_1.sqlite` 投影读取 byte offset → 从 JSONL 精确读取最新几条 turn 的 item → 重构模型可见上下文
+- `ModelContextScan`：带进度回调的 JSONL 流式扫描
+
+### 搜索
+
+- 全文搜索：调用 `rg`（ripgrep）对 `sessions/*.jsonl` 做 `--fixed-strings --ignore-case` 匹配，再对压缩文件做行级 fallback 扫描（`rollout/src/search.rs`）
+- 名称搜索：`session_index.jsonl` 反向扫描
+
+### 写入链路（一次 turn 的持久化视角）
+
+```
+core Session
+  → RolloutRecorder (mpsc channel)
+    → 后台 writer task
+      → JSONL 文件 append
+      → LiveWriter 标记脏页
+  → ThreadStore::append_items
+    → 同时更新 LiveThread 内存状态
+    → persistence_metrics 测量/filter
+  → ThreadStore::persist_thread
+    → SQLite thread_history 更新 byte offset
+    → state_db 更新 metadata
+    → session_index 更新名称（如需要）
+```
+
+### 关键设计决策
+
+- **JSONL 是 source of truth**，SQLite 是索引/投影。即使 SQLite 丢失，JSONL 可以完整回放所有会话。
+- **压缩不与写入耦合**：热文件保持 `.jsonl`，后台异步压缩。
+- **ThreadStore trait 隔离存储实现**：未来若需支持远程存储（如 S3），只需新增 ThreadStore impl。
+- **byte offset 投影避免了 JSONL 全量扫描**：O(1) 跳转到任意 turn 的首条 item。
+
 ## 阶段 1：产品与运行模型
 
 ### 前端入口对照
