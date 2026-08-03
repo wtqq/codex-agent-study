@@ -204,6 +204,125 @@ flowchart TB
 一句话总结：
 ```
 
+## 技术架构
+
+### 技术栈
+
+| 维度 | 选型 |
+|------|------|
+| 语言 | Rust（agent 引擎），TS/Python 仅为外部 SDK |
+| 构建 | Cargo workspace（80+ crate）+ Bazel |
+| 异步运行时 | Tokio（多线程 work-stealing） |
+| 序列化 | serde + JSON-RPC 2.0 |
+| 持久化 | SQLite（rollout state）+ Tantivy（全文搜索）+ 文件系统（config/cache） |
+| 模型协议 | OpenAI Responses API（流式 HTTP），兼容 Ollama/LM Studio/DeepSeek |
+| 沙箱 | macOS Seatbelt / Windows unelevated / Linux bubblewrap |
+
+### 进程模型
+
+```
++----------+  +----------+        +----------+  +----------+  +------+
+|   TUI    |  |   exec   |        | VS Code  |  | Desktop  |  | SDK  |
++----+-----+  +----+-----+        +----+-----+  +----+-----+  +--+---+
+     |             |                   |              |           |
+     | in-process  |                   |     stdio / websocket / unix socket
+     v             v                   v              v           v
++-----------------------+   +------------------------------------------+
+|  app-server-client     |   |  codex app-server（独立进程）              |
+|  +-------------------+ |   |  +------------------------------------+ |
+|  | app-server        | |   |  | JSON-RPC 2.0 handler              | |
+|  | runtime（同进程）   | |   |  | (thread/* / turn/* / approvals…)   | |
+|  | typed channel     | |   |  +------------------+-----------------+ |
+|  +--------+----------+ |   +---------------------+-------------------+
+|           |            |                         |
++-----------+------------+                         |
+            |          +----------------------------+
+            v          v
+        +-------------------+
+        |    codex-core      |
+        |  ThreadManager     |
+        |  Session / Turn    |
+        |  ModelClient       |
+        |  ToolRouter        |
+        |  WorldState        |
+        +---------+----------+
+                  |
+     +------------+------------+
+     v                         v
++------------------+    +----------------------+
+| 子进程：shell/cmd  |    | MCP servers（子进程）   |
+| 沙箱隔离执行       |    |  stdio / ws 通信       |
++------------------+    +----------------------+
+```
+
+- TUI / exec 通过 `app-server-client` 在同进程内启动 app-server runtime，用 typed channel（非 stdio）直接驱动 core。
+- IDE / Desktop / SDK 连接独立 `codex app-server` 进程，走真正的 JSON-RPC over stdio/ws/socket。
+- 多个会话共享一个进程和 Tokio runtime，模型请求异步不阻塞其他会话。
+- 工具执行 spawn 独立沙箱子进程。
+
+### Crate 分层
+
+```
++-------------------------------------+
+| Entry: cli / tui / exec / app-server |
++-------------------------------------+
+| Protocol: app-server-protocol/client |
+|           app-server-daemon/transport |
++-------------------------------------+
+| Core: core / core-api / core-skills  |
+|       core-plugins                    |
++-------------------------------------+
+| Exec: exec-server / shell-command    |
+|       shell-escalation / sandboxing   |
++-------------------------------------+
+| Extensions: ext/skills ext/mcp       |
+|  ext/connectors ext/guardian         |
+|  ext/memories ext/agent ext/web-search|
++-------------------------------------+
+| Models: plugin / skills / hooks      |
+|         connectors / codex-mcp /     |
+|         mcp-server / config          |
++-------------------------------------+
+| Infra: login / analytics / rollout   |
+|  http-client / model-provider        |
+|  ollama / lmstudio / file-search     |
++-------------------------------------+
+```
+
+依赖方向：Infra ← Models ← Extensions/Exec ← Core ← Protocol ← Entry。上层依赖下层，下层不感知上层。
+
+### 一次 Turn 运行时数据流
+
+```
+turn/start
+  → required_mcp_servers_for_input（算 MCP 依赖）
+  → capture_step_context（StepContext 快照）
+  → build_world_state（WorldState 组装：system prompt / skills / hooks /
+      permissions / environments / plugins）
+  → build_skills_and_plugins（注入点名 skills 的 SKILL.md + plugins 的 MCP/App 清单）
+  → hooks: UserPromptSubmit / PreToolUse
+  → build_model_request → ModelClient.stream（HTTP POST → SSE 流）
+      ├── agentMessage → 推前端
+      ├── tool_call → ToolRouter.dispatch → ToolOrchestrator:
+      │   approval（hook → Guardian → 用户）→ sandbox 子进程 → 结构化结果
+      └── loop until 模型不再请求工具
+  → hooks: PostToolUse / Stop
+  → rollout 持久化（SQLite + Tantivy 索引）
+  → turn/completed
+```
+
+### 扩展模型对比
+
+| 扩展 | 接入点 | 运行时形态 | 生命周期 |
+|------|--------|-----------|---------|
+| Skills | prompt 注入（SKILL.md） | 模型按需读文件 | 文件存在即生效 |
+| Plugins | 四路展开进 Skills/MCP/Apps/Hooks | 启动加载，config 控制 | install/upgrade/sync |
+| MCP servers | ToolContributor + config | 子进程 stdio/ws | 按需启动/停止 |
+| Hooks | 11 个生命周期事件 | 外部命令 JSON io | 配置声明，事件触发 |
+| Extensions | ExtensionRegistry trait | 同进程 Rust trait impl | 编译链接，启动注册 |
+
+> 上方的总体架构图是 **逻辑架构**（分层视图），本节是 **技术架构**（语言 / 进程 / crate / 数据流）。两张图互补：逻辑架构讲 design philosophy，技术架构讲 how it actually works。
+
 ## 阶段 1：产品与运行模型
 
 ### 前端入口对照
