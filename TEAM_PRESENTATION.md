@@ -138,10 +138,10 @@ turn/start (用户输入)
   |
   v
 2. 冻结 StepContext（步骤快照） ← 固定环境、MCP 工具清单、审批策略
-  |
-  v
-3. 组装 WorldState（世界状态） ← 系统提示 + Skills 目录 + Plugins 说明 +
-  |                               权限说明 + 环境说明 + Hooks 上下文
+|
+v
+3. 组装可见上下文（WorldState 系统） ← 系统提示 + Skills 目录 + Plugins 说明 +
+ |                               权限说明 + 环境说明 + Hooks 上下文
   v
 4. 注入点名 Skills 的 SKILL.md 全文 + 点名 Plugins 的 MCP/App 清单
   |
@@ -178,7 +178,7 @@ turn/start (用户输入)
 
 ---
 
-## 6. 上下文系统：WorldState（世界状态/上下文）组装
+## 6. 上下文系统：WorldState（可见上下文拼装）
 
 **模型收到的 prompt 不是一段固定模板,而是 12+ 个 WorldStateSection 增量拼装的结果。**
 
